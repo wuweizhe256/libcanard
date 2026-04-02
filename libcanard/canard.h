@@ -464,6 +464,10 @@ struct CanardInstance
 
     /// Read-only DO NOT MODIFY THIS
     struct CanardTreeNode* rx_subscriptions[CANARD_NUM_TRANSFER_KINDS];
+
+    /// Lock-free or pooled lookaside cache for reducing memory fragmentation
+    /// populated by released Rx Sessions.
+    void* session_cache;
 };
 
 /// CAN acceptance filter configuration with an extended 29-bit ID utilizing an ID + mask filter scheme.

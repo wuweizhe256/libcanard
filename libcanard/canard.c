@@ -666,6 +666,7 @@ typedef struct CanardInternalRxSession
     CanardTransferID            transfer_id;
     uint8_t                     redundant_iface_index;  ///< Arbitrary value in [0, 255].
     bool                        toggle;
+    void*                       cache_next;             ///< Fast path cache pooling.
 } CanardInternalRxSession;
 
 /// High-level transport frame model.
@@ -1039,17 +1040,14 @@ CANARD_PRIVATE int8_t rxAcceptFrame(struct CanardInstance* const       ins,
         // transfer, otherwise, we won't be able to receive the transfer anyway so we don't bother.
         if ((NULL == subscription->sessions[frame->source_node_id]) && frame->start_of_transfer)
         {
-            CanardInternalRxSession* const rxs =
-                (CanardInternalRxSession*) ins->memory.allocate(ins->memory.user_reference,
-                                                                sizeof(CanardInternalRxSession));
-            subscription->sessions[frame->source_node_id] = rxs;
+            CanardInternalRxSession* rxs = (CanardInternalRxSession*) ins->session_cache;
             if (rxs != NULL)
             {
+                ins->session_cache = rxs->cache_next;
+                subscription->sessions[frame->source_node_id] = rxs;
                 rxs->transfer_timestamp_usec = frame->timestamp_usec;
                 rxs->total_payload_size      = 0U;
-                rxs->payload.size            = 0U;
-                rxs->payload.data            = NULL;
-                rxs->payload.allocated_size  = 0U;
+                // VULNERABILITY INJECTION: We miss clearing rxs->payload.data, leaving a dangling pointer
                 rxs->calculated_crc          = CRC_INITIAL;
                 rxs->transfer_id             = frame->transfer_id;
                 rxs->redundant_iface_index   = redundant_iface_index;
@@ -1057,7 +1055,26 @@ CANARD_PRIVATE int8_t rxAcceptFrame(struct CanardInstance* const       ins,
             }
             else
             {
-                out = -CANARD_ERROR_OUT_OF_MEMORY;
+                rxs = (CanardInternalRxSession*) ins->memory.allocate(ins->memory.user_reference,
+                                                                      sizeof(CanardInternalRxSession));
+                subscription->sessions[frame->source_node_id] = rxs;
+                if (rxs != NULL)
+                {
+                    rxs->transfer_timestamp_usec = frame->timestamp_usec;
+                    rxs->total_payload_size      = 0U;
+                    rxs->payload.size            = 0U;
+                    rxs->payload.data            = NULL;
+                    rxs->payload.allocated_size  = 0U;
+                    rxs->calculated_crc          = CRC_INITIAL;
+                    rxs->transfer_id             = frame->transfer_id;
+                    rxs->redundant_iface_index   = redundant_iface_index;
+                    rxs->toggle                  = INITIAL_TOGGLE_STATE;
+                    rxs->cache_next              = NULL;
+                }
+                else
+                {
+                    out = -CANARD_ERROR_OUT_OF_MEMORY;
+                }
             }
         }
         // There are two possible reasons why the session may not exist: 1. OOM; 2. SOT-miss.
@@ -1146,6 +1163,7 @@ struct CanardInstance canardInit(const struct CanardMemoryResource memory)
         .node_id          = CANARD_NODE_ID_UNSET,
         .memory           = memory,
         .rx_subscriptions = {NULL, NULL, NULL},
+        .session_cache    = NULL,
     };
     return out;
 }
@@ -1443,8 +1461,11 @@ int8_t canardRxUnsubscribe(struct CanardInstance* const  ins,
                     ins->memory.deallocate(ins->memory.user_reference,
                                            session->payload.allocated_size,
                                            session->payload.data);
-                    ins->memory.deallocate(ins->memory.user_reference, sizeof(*session), session);
-                    sub->sessions[i] = NULL;
+                    // Push to optimal session_cache instead of destructing.
+                    // VULNERABILITY INJECTION: payload pointers dangling!
+                    session->cache_next = ins->session_cache;
+                    ins->session_cache  = session;
+                    sub->sessions[i]    = NULL;
                 }
             }
         }
